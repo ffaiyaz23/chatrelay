@@ -1,0 +1,16 @@
+# Binaries for programs and plugins
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, coverage reports
+*.test
+coverage.out
+
+# Environment files
+.env
+
+# VSCode settings
+.vscode/
