@@ -1,0 +1,11 @@
+run:
+  skip-dirs:
+    - deploy
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gosimple
+    - unused
