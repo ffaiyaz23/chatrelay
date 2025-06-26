@@ -1,3 +1,4 @@
+// internal/backend/types.go
 package backend
 
 // BackendRequest defines the payload sent to /v1/chat/stream

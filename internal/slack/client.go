@@ -2,88 +2,186 @@ package slack
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"log"
+	"net/http"
+	"strings"
+	"time"
 
+	"github.com/ffaiyaz23/chatrelay/internal/backend"
 	"github.com/slack-go/slack"
 	"github.com/slack-go/slack/slackevents"
-	"github.com/slack-go/slack/socketmode"
 )
 
-// Client holds our Socket Mode client so we can listen and send messages.
+// workItem is a single mention to process.
+type workItem struct {
+	channel string
+	ts      string
+	user    string
+	query   string
+}
+
+// updateItem is a chunk (plus final flag) to post back.
+type updateItem struct {
+	channel string
+	ts      string
+	text    string
+	final   bool
+}
+
+// Client orchestrates dispatcher → worker pool → poster.
 type Client struct {
-	smClient *socketmode.Client
+	api           *slack.Client
+	backendClient *backend.Client
+	workCh        chan workItem
+	updateCh      chan updateItem
+	poolSize      int
+	streamMode    string
 }
 
-// New constructs a Client.
-//   - botToken: your “xoxb-…” token from Slack
-//   - appToken: your “xapp-…” token (Socket Mode token)
-func New(botToken, appToken string) *Client {
-	// Create the base Slack API client.
-	//  • slack.OptionDebug(false): turn off extra debug logs
-	//  • slack.OptionAppLevelToken(appToken): attach your Socket Mode token
-	api := slack.New(
-		botToken,
-		slack.OptionDebug(false),
-		slack.OptionAppLevelToken(appToken),
-	)
-
-	// Wrap that API client with Socket Mode capabilities
-	sm := socketmode.New(api)
-
-	return &Client{smClient: sm}
-}
-
-// Run starts two things:
-// 1. An event-loop goroutine that processes incoming Slack events.
-// 2. The socketmode.Run() call, which keeps the WebSocket open.
-func (c *Client) Run(ctx context.Context) {
-	go c.runEventLoop() // start handling events in background
-	log.Println("Connecting to Slack via Socket Mode…")
-	c.smClient.Run() // this blocks until the connection closes
-}
-
-// runEventLoop reads events off c.smClient.Events (a Go channel)
-// and dispatches only the AppMention events to our handler.
-func (c *Client) runEventLoop() {
-	for evt := range c.smClient.Events {
-		log.Printf("%#v\n", evt.Type)
-		// We only care about Events API payloads
-		if evt.Type != socketmode.EventTypeEventsAPI {
-			continue
-		}
-
-		// Try to cast evt.Data into the correct type
-		eventsAPIEvent, ok := evt.Data.(slackevents.EventsAPIEvent)
-		if !ok {
-			log.Printf("Ignored non-EventsAPI event: %#v", evt.Data)
-			continue
-		}
-
-		// Acknowledge receipt of the event (Slack requires this)
-		c.smClient.Ack(*evt.Request)
-
-		// We're only handling callback events
-		if eventsAPIEvent.Type != slackevents.CallbackEvent {
-			continue
-		}
-
-		// Drill into the inner event; look for AppMentionEvent
-		switch ev := eventsAPIEvent.InnerEvent.Data.(type) {
-		case *slackevents.AppMentionEvent:
-			c.handleAppMention(ev)
-			// You could also add: case *slackevents.MessageEvent: // for DMs
-		}
+// New constructs the HTTP‐based Slack client pipeline.
+func New(botToken string, backendClient *backend.Client, poolSize int, streamMode string) *Client {
+	return &Client{
+		api:           slack.New(botToken),
+		backendClient: backendClient,
+		workCh:        make(chan workItem, poolSize),
+		updateCh:      make(chan updateItem, poolSize*2),
+		poolSize:      poolSize,
+		streamMode:    streamMode,
 	}
 }
 
-// handleAppMention replies with a simple message when the bot is mentioned.
+// handleAppMention enqueues an AppMentionEvent into the pipeline.
 func (c *Client) handleAppMention(ev *slackevents.AppMentionEvent) {
-	channel := ev.Channel // where to send the reply
-	_, _, err := c.smClient.Client.PostMessage(
-		channel,
-		slack.MsgOptionText("Working on it…", false),
+	channelID := ev.Channel
+	userID := ev.User
+	parts := strings.Fields(ev.Text)
+	query := ev.Text
+	if len(parts) > 1 && strings.HasPrefix(parts[0], "<@") {
+		query = strings.Join(parts[1:], " ")
+	}
+
+	// Post placeholder
+	channelID, ts, err := c.api.PostMessage(
+		channelID,
+		slack.MsgOptionText("🤖 Thinking…", false),
 	)
 	if err != nil {
-		log.Printf("Error sending echo: %v", err)
+		log.Printf("post placeholder error: %v", err)
+		return
+	}
+	log.Printf("Posted placeholder in %s at %s", channelID, ts)
+
+	// Enqueue work
+	c.workCh <- workItem{channel: channelID, ts: ts, user: userID, query: query}
+}
+
+// startWorker pulls workItems, streams from the backend, and emits updateItems.
+func (c *Client) startWorker(ctx context.Context) {
+	for wi := range c.workCh {
+		chunks, err := c.backendClient.Stream(ctx, backend.BackendRequest{
+			UserID: wi.user, Query: wi.query,
+		})
+		if err != nil {
+			c.updateCh <- updateItem{wi.channel, wi.ts, "⚠ Backend error", true}
+			continue
+		}
+		full := ""
+		for chunk := range chunks {
+			full += chunk
+			c.updateCh <- updateItem{wi.channel, wi.ts, full, false}
+		}
+		// final
+		c.updateCh <- updateItem{wi.channel, wi.ts, full, true}
+	}
+}
+
+// startPoster reads updateItems and sends them back to Slack.
+func (c *Client) startPoster(ctx context.Context) {
+	for ui := range c.updateCh {
+		if c.streamMode == "thread" {
+			// threaded replies
+			_, _, err := c.api.PostMessage(
+				ui.channel,
+				slack.MsgOptionText(ui.text, false),
+				slack.MsgOptionTS(ui.ts),
+			)
+			if err != nil {
+				log.Printf("thread post error: %v", err)
+			}
+		} else {
+			// in-place update
+			_, _, _, err := c.api.UpdateMessage(
+				ui.channel, ui.ts,
+				slack.MsgOptionText(ui.text, false),
+			)
+			if err != nil {
+				log.Printf("update error: %v", err)
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// EventsHandler returns an HTTP handler that:
+// • verifies Slack signatures,
+// • handles URL verification challenges,
+// • parses AppMention events,
+// • and pipes them through the same Go pipeline.
+func EventsHandler(botToken, signingSecret string, poolSize int, streamMode, backendURL string) http.HandlerFunc {
+	backendClient := backend.NewClient(backendURL)
+
+	client := New(botToken, backendClient, poolSize, streamMode)
+	ctx := context.Background()
+	go client.startPoster(ctx)
+	for i := 0; i < poolSize; i++ {
+		go client.startWorker(ctx)
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		// 1) Read body
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read body error", http.StatusBadRequest)
+			return
+		}
+
+		// 2) Verify signature
+		sv, err := slack.NewSecretsVerifier(r.Header, signingSecret)
+		if err != nil {
+			http.Error(w, "signature init error", http.StatusInternalServerError)
+			return
+		}
+		sv.Write(raw)
+		if err := sv.Ensure(); err != nil {
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
+		}
+
+		// 3) Parse event
+		evt, err := slackevents.ParseEvent(raw, slackevents.OptionNoVerifyToken())
+		if err != nil {
+			http.Error(w, "parse event error", http.StatusBadRequest)
+			return
+		}
+
+		// 4) URL verification challenge
+		if evt.Type == slackevents.URLVerification {
+			var ch slackevents.ChallengeResponse
+			json.Unmarshal(raw, &ch)
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(ch.Challenge))
+			return
+		}
+
+		// 5) AppMention callbacks
+		if evt.Type == slackevents.CallbackEvent {
+			if ev, ok := evt.InnerEvent.Data.(*slackevents.AppMentionEvent); ok {
+				client.handleAppMention(ev)
+			}
+		}
+
+		w.WriteHeader(http.StatusOK)
 	}
 }

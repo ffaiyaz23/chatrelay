@@ -1,33 +1,49 @@
 package main
 
 import (
-	"context"
 	"log"
+	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
+	"strconv"
 
+	"github.com/ffaiyaz23/chatrelay/internal/backend"
 	"github.com/ffaiyaz23/chatrelay/internal/config"
-	slackclient "github.com/ffaiyaz23/chatrelay/internal/slack"
+	"github.com/ffaiyaz23/chatrelay/internal/slack"
 )
 
 func main() {
-	// Load tokens (will fatally exit if missing)
 	cfg := config.Load()
-	log.Printf("DEBUG: BotToken len=%d, AppToken len=%d\n", len(cfg.BotToken), len(cfg.AppToken))
 
-	// Create Slack Socket Mode client
-	client := slackclient.New(cfg.BotToken, cfg.AppToken)
+	// 1) Auto-start mock backend if none provided
+	var backendURL string
+	if cfg.BackendURL == "" {
+		server, addr := backend.StartMockServer(":0")
+		defer server.Close()
+		backendURL = "http://" + addr
+	} else {
+		backendURL = cfg.BackendURL
+	}
+	log.Printf("Using backend at %s (mode=%s)", backendURL, cfg.BackendMode)
 
-	// Handle graceful shutdown
-	ctx, cancel := signal.NotifyContext(context.Background(),
-		os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	// 2) Worker pool size
+	poolSize, _ := strconv.Atoi(cfg.WorkerPoolSize)
 
-	// Start the Slack client in a goroutine
-	go client.Run(ctx)
+	// 3) Wire up Events API endpoint, passing in the real backend URL
+	http.HandleFunc("/events",
+		slack.EventsHandler(
+			cfg.BotToken,
+			cfg.SigningSecret,
+			poolSize,
+			cfg.StreamMode,
+			backendURL, // ← new parameter
+		),
+	)
 
-	log.Println("ChatRelay is running. Press Ctrl+C to stop.")
-	<-ctx.Done()
-	log.Println("Shutting down...")
+	// 4) Start HTTP server
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+	log.Printf("Listening for Events API on :%s/events", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }

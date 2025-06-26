@@ -1,3 +1,4 @@
+// internal/backend/client.go
 package backend
 
 import (
@@ -52,7 +53,9 @@ func (c *Client) Stream(ctx context.Context, req BackendRequest) (<-chan string,
 					var chunk struct {
 						TextChunk string `json:"text_chunk"`
 					}
-					json.Unmarshal([]byte(line[len("data: "):]), &chunk)
+					if err := json.Unmarshal([]byte(line[len("data: "):]), &chunk); err != nil {
+						continue
+					}
 					if chunk.TextChunk != "" {
 						out <- chunk.TextChunk
 					}
@@ -62,7 +65,7 @@ func (c *Client) Stream(ctx context.Context, req BackendRequest) (<-chan string,
 			var resp struct {
 				Full string `json:"full_response"`
 			}
-			json.NewDecoder(hresp.Body).Decode(&resp)
+			_ = json.NewDecoder(hresp.Body).Decode(&resp)
 			words := strings.Fields(resp.Full)
 			for _, w := range words {
 				out <- w + " "

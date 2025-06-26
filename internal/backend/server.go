@@ -1,3 +1,4 @@
+// internal/backend/server.go
 package backend
 
 import (
@@ -36,18 +37,26 @@ func StartMockServer(addr string) (*http.Server, string) {
 			chunks := strings.Split(full, " ")
 			for i, word := range chunks {
 				event := fmt.Sprintf("id: %d\nevent: message_part\ndata: {\"text_chunk\": \"%s \"}\n\n", i, word)
-				w.Write([]byte(event))
+				if _, err := w.Write([]byte(event)); err != nil {
+					log.Printf("write SSE chunk error: %v", err)
+					return
+				}
 				flusher.Flush()
 				time.Sleep(250 * time.Millisecond)
 			}
-			w.Write([]byte("id: done\nevent: stream_end\ndata: {\"status\": \"done\"}\n\n"))
+			endEvent := "id: done\nevent: stream_end\ndata: {\"status\": \"done\"}\n\n"
+			if _, err := w.Write([]byte(endEvent)); err != nil {
+				log.Printf("write SSE end error: %v", err)
+			}
 			return
 		}
 
 		// JSON mode
 		w.Header().Set("Content-Type", "application/json")
 		resp := map[string]string{"full_response": full}
-		json.NewEncoder(w).Encode(resp)
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			log.Printf("write JSON error: %v", err)
+		}
 	})
 
 	ln, err := net.Listen("tcp", addr)
@@ -55,12 +64,12 @@ func StartMockServer(addr string) (*http.Server, string) {
 		log.Fatalf("Mock backend listen error: %v", err)
 	}
 	server := &http.Server{Handler: mux}
-	// serve in background
 	go func() {
 		log.Printf("Mock backend listening on %s (mode=%s)", ln.Addr().String(), os.Getenv("BACKEND_MODE"))
 		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Mock backend error: %v", err)
 		}
 	}()
+
 	return server, ln.Addr().String()
 }

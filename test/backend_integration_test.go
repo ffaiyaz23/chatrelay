@@ -1,3 +1,4 @@
+// test/backend_integration_test.go
 package backend_test
 
 import (
@@ -9,9 +10,7 @@ import (
 )
 
 func TestMockBackend_SSE(t *testing.T) {
-	// set mode for SSE
 	t.Setenv("BACKEND_MODE", "sse")
-	// start mock server on random port
 	server, addr := backend.StartMockServer(":0")
 	defer server.Close()
 
@@ -25,8 +24,8 @@ func TestMockBackend_SSE(t *testing.T) {
 	}
 
 	count := 0
-	for part := range ch {
-		if part == "" {
+	for chunk := range ch {
+		if chunk == "" {
 			t.Errorf("Empty chunk received")
 		}
 		count++
@@ -37,7 +36,6 @@ func TestMockBackend_SSE(t *testing.T) {
 }
 
 func TestMockBackend_JSON(t *testing.T) {
-	// set mode for JSON
 	t.Setenv("BACKEND_MODE", "json")
 	server, addr := backend.StartMockServer(":0")
 	defer server.Close()
